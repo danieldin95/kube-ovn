@@ -849,15 +849,15 @@ func (c *Controller) reconcileGateway(subnet *kubeovnv1.Subnet) error {
 	} else {
 		// if gw is distributed remove activateGateway field
 		if subnet.Spec.GatewayType == kubeovnv1.GWDistributedType {
-			if subnet.Status.ActivateGateway == "" {
+			if subnet.Spec.GatewayNode == "" {
 				return nil
 			}
-			subnet.Status.ActivateGateway = ""
+			subnet.Spec.GatewayNode = ""
 			bytes, err := subnet.Status.Bytes()
 			if err != nil {
 				return err
 			}
-			_, err = c.config.KubeOvnClient.KubeovnV1().Subnets().Patch(context.Background(), subnet.Name, types.MergePatchType, bytes, metav1.PatchOptions{}, "status")
+			_, err = c.config.KubeOvnClient.KubeovnV1().Subnets().Patch(context.Background(), subnet.Name, types.MergePatchType, bytes, metav1.PatchOptions{}, "")
 			if err != nil {
 				return err
 			}
@@ -887,7 +887,7 @@ func (c *Controller) reconcileGateway(subnet *kubeovnv1.Subnet) error {
 					nextHop = pod.Annotations[util.NorthGatewayAnnotation]
 				}
 
-				if err := c.ovnClient.AddStaticRoute(ovs.PolicySrcIP, pod.Annotations[util.IpAddressAnnotation], nextHop, c.config.ClusterRouter); err != nil {
+				if err := c.ovnClient.AddStaticRoute(ovs.PolicySrcIP, pod.Annotations[util.IpAddressAnnotation], nextHop, c.config.ClusterRouter, false); err != nil {
 					klog.Errorf("add static route failed, %v", err)
 					return err
 				}
@@ -895,36 +895,8 @@ func (c *Controller) reconcileGateway(subnet *kubeovnv1.Subnet) error {
 			return c.deleteStaticRoute(subnet.Spec.CIDRBlock, c.config.ClusterRouter, subnet)
 		} else {
 			klog.Infof("start to init centralized gateway for subnet %s", subnet.Name)
-
-			// check if activateGateway still ready
-			if subnet.Status.ActivateGateway != "" {
-				node, err := c.nodesLister.Get(subnet.Status.ActivateGateway)
-				if err == nil && nodeReady(node) {
-					klog.Infof("subnet %s uses the old activate gw %s", subnet.Name, node.Name)
-					return nil
-				}
-			}
-
-			klog.Info("find a new activate node")
-			// need a new activate gateway
-			newActivateNode := ""
-			var nodeTunlIPAddr []net.IP
-			for _, gw := range strings.Split(subnet.Spec.GatewayNode, ",") {
-				gw = strings.TrimSpace(gw)
-				node, err := c.nodesLister.Get(gw)
-				if err == nil && nodeReady(node) {
-					newActivateNode = node.Name
-					nodeTunlIPAddr, err = getNodeTunlIP(node)
-					if err != nil {
-						return err
-					}
-					klog.Infof("subnet %s uses a new activate gw %s", subnet.Name, node.Name)
-					break
-				}
-			}
-			if newActivateNode == "" {
-				klog.Warningf("all subnet %s gws are not ready", subnet.Name)
-				subnet.Status.ActivateGateway = newActivateNode
+			if subnet.Spec.GatewayNode == "" {
+				klog.Errorf("subnet %s Spec.GatewayNode field must be specified for centralized gateway type", subnet.Name)
 				subnet.Status.NotReady("NoReadyGateway", "")
 				bytes, err := subnet.Status.Bytes()
 				if err != nil {
@@ -934,9 +906,27 @@ func (c *Controller) reconcileGateway(subnet *kubeovnv1.Subnet) error {
 				return err
 			}
 
-			if !subnet.Spec.UnderlayGateway {
-				nextHop := getNextHopByTunnelIP(nodeTunlIPAddr)
-				if err := c.ovnClient.AddStaticRoute(ovs.PolicySrcIP, subnet.Spec.CIDRBlock, nextHop, c.config.ClusterRouter); err != nil {
+			nodeIPs := make([]string, len(strings.Split(subnet.Spec.GatewayNode, ",")))
+			for _, gw := range strings.Split(subnet.Spec.GatewayNode, ",") {
+				gw = strings.TrimSpace(gw)
+				node, err := c.nodesLister.Get(gw)
+				if err == nil && nodeReady(node) {
+					nodeTunlIP := node.Annotations[util.IpAddressAnnotation]
+					if nodeTunlIP == "" {
+						klog.Errorf("gateway node %v has no ip annotation", node.Name)
+						continue
+					}
+					nodeIPs = append(nodeIPs, nodeTunlIP)
+				}
+			}
+			nodeIPs, err = c.filterEcmpStaticRoute(nodeIPs, subnet.Spec.CIDRBlock)
+			if err != nil {
+				klog.Errorf("add ecmp static route for subnet %v, error %v", subnet.Name, err)
+			}
+			klog.Infof("subnet %s uses centralized gw %v", subnet.Name, nodeIPs)
+
+			for _, nextHop := range nodeIPs {
+				if err := c.ovnClient.AddStaticRoute(ovs.PolicySrcIP, subnet.Spec.CIDRBlock, nextHop, c.config.ClusterRouter, true); err != nil {
 					klog.Errorf("failed to add static route, %v", err)
 					return err
 				}
@@ -950,7 +940,6 @@ func (c *Controller) reconcileGateway(subnet *kubeovnv1.Subnet) error {
 				}
 			}
 
-			subnet.Status.ActivateGateway = newActivateNode
 			bytes, err := subnet.Status.Bytes()
 			subnet.Status.Ready("ReconcileCentralizedGatewaySuccess", "")
 			if err != nil {
@@ -1191,4 +1180,32 @@ func filterRepeatIPRange(mapIps map[string]ipam.IPRange) map[string]ipam.IPRange
 		}
 	}
 	return mapIps
+}
+
+func (c *Controller) filterEcmpStaticRoute(nodeIps []string, cidrBlock string) ([]string, error) {
+	var nextHops []string
+	routes, err := c.ovnClient.GetStaticRouteList(c.config.ClusterRouter)
+	if err != nil {
+		klog.Errorf("failed to list static route %v", err)
+		return nextHops, err
+	}
+	if len(nodeIps) == 0 {
+		return nextHops, fmt.Errorf("nexthop is nil for add ecmp static route")
+	}
+
+	for _, route := range routes {
+		if route.Policy != ovs.PolicySrcIP {
+			continue
+		}
+		for _, nodeIp := range nodeIps {
+			if route.CIDR == cidrBlock && route.NextHop == nodeIp {
+				klog.Infof("src-ip static route exist for cidr %s, nexthop %v", cidrBlock, nodeIp)
+				continue
+			} else {
+				nextHops = append(nextHops, nodeIp)
+			}
+		}
+	}
+	klog.Infof("ecmp static route to add, cidr %s, nexthop %v", cidrBlock, nextHops)
+	return nextHops, nil
 }

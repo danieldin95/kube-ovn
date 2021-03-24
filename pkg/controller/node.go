@@ -225,7 +225,7 @@ func (c *Controller) handleAddNode(key string) error {
 	nodeAddr := util.GetNodeInternalIP(*node)
 	for _, ip := range strings.Split(ipStr, ",") {
 		if util.CheckProtocol(nodeAddr) == util.CheckProtocol(ip) {
-			err = c.ovnClient.AddStaticRoute("", nodeAddr, ip, c.config.ClusterRouter)
+			err = c.ovnClient.AddStaticRoute("", nodeAddr, ip, c.config.ClusterRouter, false)
 			if err != nil {
 				klog.Errorf("failed to add static router from node to ovn0 %v", err)
 				return err
@@ -307,34 +307,15 @@ func (c *Controller) handleUpdateNode(key string) error {
 		return err
 	}
 
-	if nodeReady(node) {
-		for _, subnet := range subnets {
-			if subnet.Status.ActivateGateway == "" && gatewayContains(subnet.Spec.GatewayNode, node.Name) {
-				if err := c.reconcileGateway(subnet); err != nil {
-					return err
-				}
-			}
-		}
-	} else {
-		for _, subnet := range subnets {
-			if subnet.Status.ActivateGateway == node.Name {
-				if err := c.reconcileGateway(subnet); err != nil {
-					return err
-				}
+	for _, subnet := range subnets {
+		if util.GatewayContains(subnet.Spec.GatewayNode, node.Name) {
+			if err := c.reconcileGateway(subnet); err != nil {
+				return err
 			}
 		}
 	}
-	return nil
-}
 
-func gatewayContains(gatewayNodeStr, gateway string) bool {
-	for _, gw := range strings.Split(gatewayNodeStr, ",") {
-		gw = strings.TrimSpace(gw)
-		if gw == gateway {
-			return true
-		}
-	}
-	return false
+	return nil
 }
 
 func (c *Controller) createOrUpdateCrdIPs(key, ip, mac string) error {
